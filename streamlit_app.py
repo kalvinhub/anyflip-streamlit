@@ -32,6 +32,7 @@ if submitted:
     elif time.monotonic() - st.session_state.get("last_attempt", 0) < 12:
         st.warning("Please leave 12 seconds between download requests.")
     else:
+        status = None
         try:
             # Fail fast on invalid input before using a public server's CPU.
             parse_book_url(url)
@@ -46,8 +47,12 @@ if submitted:
             st.session_state["pdf"] = pdf
             st.success("Your PDF is ready.")
         except DownloadError as exc:
+            if status is not None:
+                status.update(label="Could not generate PDF", state="error", expanded=False)
             st.error(str(exc))
         except Exception:
+            if status is not None:
+                status.update(label="PDF generation failed", state="error", expanded=False)
             # Keep filesystem paths and internals out of the public UI.
             st.error("An unexpected error occurred. Check the server logs or try another authorized book.")
 
