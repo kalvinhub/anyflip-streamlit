@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import warnings
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -24,14 +25,18 @@ from PIL import Image, UnidentifiedImageError
 
 ASSET_HOST = "https://online.anyflip.com"
 BOOK_PART = re.compile(r"[a-zA-Z0-9_-]{1,80}\Z")
-MAX_PAGES = max(1, min(300, int(os.getenv("ANYFLIP_MAX_PAGES", "120"))))
+MAX_PAGES = max(1, min(999, int(os.getenv("ANYFLIP_MAX_PAGES", "999"))))
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_CONFIG_BYTES = 2 * 1024 * 1024
-MAX_PDF_BYTES = 90 * 1024 * 1024
-MAX_TOTAL_JPEG_BYTES = 90 * 1024 * 1024
-MAX_SECONDS = 300
-# One-process overload protection; Streamlit Cloud isn't a job queue.
-DOWNLOAD_SLOTS = threading.BoundedSemaphore(value=2)
+MAX_SINGLE_PDF_BYTES = 120 * 1024 * 1024
+MAX_PART_PDF_BYTES = 75 * 1024 * 1024
+MAX_OUTPUT_BYTES = 180 * 1024 * 1024
+MAX_TOTAL_JPEG_BYTES = 165 * 1024 * 1024
+MAX_SECONDS = 1800  # 30-minute app-side deadline; host may stop a job earlier.
+PART_PAGES = 100
+AUTO_SPLIT_ABOVE = 200
+# Shared free hosting: one conversion per Python process to limit peak RAM.
+DOWNLOAD_SLOTS = threading.BoundedSemaphore(value=1)
 Progress = Callable[[int, int], None]
 
 
@@ -44,6 +49,8 @@ class PDFResult:
     filename: str
     content: bytes
     pages: int
+    mime: str = "application/pdf"
+    parts: int = 1
 
 
 def parse_book_url(raw: str) -> str:
@@ -191,11 +198,29 @@ def fetch_limited(client: httpx.Client, url: str, max_bytes: int) -> bytes:
         raise DownloadError("Could not reach AnyFlip. Try again later.") from exc
 
 
-def create_pdf(book_url: str, progress: Progress | None = None) -> PDFResult:
-    """Download public page images and return a PDF; temporarily uses disk, not a long-lived job store."""
+def create_pdf(
+    book_url: str,
+    progress: Progress | None = None,
+    output_mode: str = "auto",
+    page_start: int = 1,
+    page_end: int | None = None,
+) -> PDFResult:
+    """Create one PDF or a ZIP of 100-page PDFs for authorized, public books.
+
+    A 999-page book is supported at the manifest level, but actual success
+    remains subject to image availability, hosting resources and output limits.
+    """
+    if output_mode not in {"auto", "single", "split"}:
+        raise DownloadError("Choose automatic, single PDF, or split ZIP output.")
+    if isinstance(page_start, bool) or not isinstance(page_start, int) or not 1 <= page_start <= MAX_PAGES:
+        raise DownloadError(f"The starting page must be between 1 and {MAX_PAGES}.")
+    if page_end is not None and (isinstance(page_end, bool) or not isinstance(page_end, int)
+                                 or not page_start <= page_end <= MAX_PAGES):
+        raise DownloadError(f"The ending page must be between {page_start} and {MAX_PAGES}.")
+
     book_path = parse_book_url(book_url)
     if not DOWNLOAD_SLOTS.acquire(blocking=False):
-        raise DownloadError("Two downloads are already running. Try again shortly.")
+        raise DownloadError("Another download is running. Try again shortly.")
     started = time.monotonic()
     try:
         with httpx.Client(
@@ -204,41 +229,91 @@ def create_pdf(book_url: str, progress: Progress | None = None) -> PDFResult:
             headers={"User-Agent": "Mozilla/5.0", "Referer": f"{ASSET_HOST}{book_path}mobile/index.html"},
         ) as client:
             config_js = fetch_limited(client, f"{ASSET_HOST}{book_path}mobile/javascript/config.js", MAX_CONFIG_BYTES)
-            title, urls = get_page_urls(extract_config(config_js.decode("utf-8-sig")), book_path)
+            title, all_urls = get_page_urls(extract_config(config_js.decode("utf-8-sig")), book_path)
+            last_page = len(all_urls) if page_end is None else page_end
+            if page_start > len(all_urls) or last_page > len(all_urls):
+                raise DownloadError(f"This book only has {len(all_urls)} pages. Adjust the requested page range.")
+            urls = all_urls[page_start - 1:last_page]
+            split = output_mode == "split" or (output_mode == "auto" and len(urls) > AUTO_SPLIT_ABOVE)
+            suffix = f" - pages {page_start}-{last_page}" if (page_start > 1 or last_page < len(all_urls)) else ""
+            basename = title + suffix
+            jpeg_total = 0
+            output_total = 0
+            part = 0
             pdf = fitz.open()
-            jpeg_size = 0
             try:
-                for index, image_url in enumerate(urls, start=1):
-                    if time.monotonic() - started > MAX_SECONDS:
-                        raise DownloadError("This download exceeded the five-minute processing limit.")
-                    raw = fetch_limited(client, image_url, MAX_IMAGE_BYTES)
-                    try:
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("error", Image.DecompressionBombWarning)
-                            with Image.open(io.BytesIO(raw)) as image:
-                                image.load()
-                                width, height = image.size
-                                if width < 1 or height < 1 or width * height > 25_000_000 or max(width, height) > 10000:
-                                    raise DownloadError(f"Page {index} exceeds the supported image dimensions.")
-                                jpeg = io.BytesIO()
-                                image.convert("RGB").save(jpeg, format="JPEG", quality=84, optimize=True)
-                    except (UnidentifiedImageError, OSError, Image.DecompressionBombWarning) as exc:
-                        raise DownloadError(f"Page {index} is not a supported public page image.") from exc
-                    jpg = jpeg.getvalue()
-                    jpeg_size += len(jpg)
-                    if jpeg_size > MAX_TOTAL_JPEG_BYTES:
-                        raise DownloadError("The finished document is too large for free hosting.")
-                    page = pdf.new_page(width=width * 0.72, height=height * 0.72)
-                    page.insert_image(page.rect, stream=jpg)
-                    if progress:
-                        progress(index, len(urls))
                 with tempfile.TemporaryDirectory(prefix="anyflip_") as tmp:
-                    filename = Path(tmp) / "book.pdf"
-                    pdf.save(filename, garbage=3, deflate=True)
-                    if filename.stat().st_size > MAX_PDF_BYTES:
-                        raise DownloadError("The PDF exceeds the 90 MB download limit.")
-                    result = PDFResult(filename=f"{title}.pdf", content=filename.read_bytes(), pages=len(urls))
-                return result
+                    folder = Path(tmp)
+                    zip_path = folder / "output.zip"
+                    archive = zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED, allowZip64=False) if split else None
+                    try:
+                        for index, image_url in enumerate(urls, start=1):
+                            if time.monotonic() - started > MAX_SECONDS:
+                                raise DownloadError("The download exceeded the 30-minute app processing limit. Try a smaller page range.")
+                            raw = fetch_limited(client, image_url, MAX_IMAGE_BYTES)
+                            try:
+                                with warnings.catch_warnings():
+                                    warnings.simplefilter("error", Image.DecompressionBombWarning)
+                                    with Image.open(io.BytesIO(raw)) as image:
+                                        image.load()
+                                        width, height = image.size
+                                        if (width < 1 or height < 1 or width * height > 25_000_000
+                                                or max(width, height) > 10000):
+                                            raise DownloadError(f"Page {page_start + index - 1} exceeds supported dimensions.")
+                                        # Max 1,800-pixel edge / JPEG 76 helps big books fit on free hosting.
+                                        if max(width, height) > 1800:
+                                            ratio = 1800 / max(width, height)
+                                            image = image.resize((max(1, round(width * ratio)),
+                                                                  max(1, round(height * ratio))), Image.Resampling.LANCZOS)
+                                            width, height = image.size
+                                        jpeg = io.BytesIO()
+                                        image.convert("RGB").save(jpeg, format="JPEG", quality=76, optimize=True)
+                            except (UnidentifiedImageError, OSError, Image.DecompressionBombWarning) as exc:
+                                raise DownloadError(f"Page {page_start + index - 1} is not a supported public page image.") from exc
+                            jpg = jpeg.getvalue()
+                            jpeg_total += len(jpg)
+                            if jpeg_total > MAX_TOTAL_JPEG_BYTES:
+                                raise DownloadError("The book exceeds the 165 MB image budget. Download a smaller page range.")
+                            if not split and jpeg_total > MAX_SINGLE_PDF_BYTES - 8 * 1024 * 1024:
+                                raise DownloadError("A single PDF would exceed the 120 MB free-host limit. Use split ZIP or a smaller page range.")
+                            page = pdf.new_page(width=width * 0.72, height=height * 0.72)
+                            page.insert_image(page.rect, stream=jpg)
+                            if progress:
+                                progress(index, len(urls))
+
+                            if split and (index % PART_PAGES == 0 or index == len(urls)):
+                                part += 1
+                                part_start = page_start + index - pdf.page_count
+                                part_end = page_start + index - 1
+                                part_name = f"{basename} - part {part:02d} - p{part_start}-{part_end}.pdf"
+                                part_path = folder / f"part_{part:03d}.pdf"
+                                pdf.save(part_path, garbage=3, deflate=True)
+                                pdf.close()
+                                pdf = fitz.open()
+                                part_size = part_path.stat().st_size
+                                if part_size > MAX_PART_PDF_BYTES:
+                                    raise DownloadError(f"Part {part} exceeds 75 MB. Select a smaller page range.")
+                                output_total += part_size
+                                if output_total > MAX_OUTPUT_BYTES:
+                                    raise DownloadError("The ZIP exceeds the 180 MB free-host limit. Download smaller page ranges.")
+                                archive.write(part_path, arcname=part_name)
+                                part_path.unlink()
+                        if split:
+                            archive.close()
+                            archive = None
+                            if zip_path.stat().st_size > MAX_OUTPUT_BYTES:
+                                raise DownloadError("The ZIP exceeds the 180 MB free-host limit. Download smaller page ranges.")
+                            return PDFResult(filename=f"{basename}.zip", content=zip_path.read_bytes(),
+                                             pages=len(urls), mime="application/zip", parts=part)
+                        pdf_path = folder / "book.pdf"
+                        pdf.save(pdf_path, garbage=3, deflate=True)
+                        if pdf_path.stat().st_size > MAX_SINGLE_PDF_BYTES:
+                            raise DownloadError("The PDF exceeds the 120 MB free-host limit. Use split ZIP or a smaller page range.")
+                        return PDFResult(filename=f"{basename}.pdf", content=pdf_path.read_bytes(),
+                                         pages=len(urls))
+                    finally:
+                        if archive is not None:
+                            archive.close()
             finally:
                 pdf.close()
     finally:

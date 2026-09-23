@@ -1,37 +1,47 @@
-# AnyFlip Streamlit Downloader
+# AnyFlip Streamlit Downloader — 999-page edition
 
-A browser-based Python image-to-PDF converter for public AnyFlip books that you **own or have permission to save**. This is a reimplementation of the download workflow; the Windows `.exe` is **not** run on the server.
+Browser-based image-to-PDF conversion for **public AnyFlip books you own or have permission to save**. It does not run the original Windows `.exe` and does not bypass access restrictions or DRM.
 
-## Deploy on Streamlit Community Cloud (recommended)
+## What's new
 
-1. Create a new **GitHub repository** (e.g. `anyflip-streamlit`). Unzip this archive and put its **contents** into the repository root. Do **not** upload the zip itself or the original `.exe`.
-2. Go to **https://share.streamlit.io/** and sign in with GitHub. Choose **Create app → Yup, I have an app**.
-3. Select your repository, `main` branch and **Main file path** `streamlit_app.py`. Select **Python 3.12** in Advanced settings, if offered, and choose an available `*.streamlit.app` URL.
-4. Click **Deploy**. Share the public URL. Changes pushed to GitHub are redeployed automatically.
+- Accepts public books containing **up to 999 pages** instead of 120.
+- **Automatic** output: a single PDF for up to 200 selected pages; for larger selections, a ZIP containing PDFs split into **100-page parts** (e.g. a 999-page book becomes 10 PDF files in one ZIP).
+- Optional *one PDF* and *split ZIP* modes. One PDF may consume more memory.
+- Optional page-range field, e.g. `201-400`, for large books that exceed free-hosting limits.
+- Improved memory management: build one ZIP part at a time, compress page images to a 1,800-pixel maximum edge with quality 76, and reject overly large jobs.
+- Preserves previous fixes for `../files/large/...` relative page-image paths and blocks cross-host or outside-book URLs.
 
-No environment variables or API keys are required. For a private repository, ensure Streamlit has repository access; choose your app's visibility based on the audience.
+**999 pages is a supported upper bound, not a guarantee of successful conversion on free Streamlit hosting.** Network reliability, image sizes, unsupported manifest variations, CPU/RAM pressure and the provider's own limits can prevent full-book completion. This edition enforces a 30-minute app-side deadline, one conversion at a time, 120 MB for a single PDF, 180 MB for a ZIP, 12 MB per image and 165 MB total converted JPEG images. ZIP parts have a 75 MB per-part cap. If a book is too large, use the page-range field, or deploy a dedicated backend with a job queue and persistent storage. Public Streamlit hosting and its download widget may hold sizeable results in RAM.
 
-## Run locally
+## Update your existing Streamlit app
+
+1. Extract this archive and replace **`anyflip_core.py`**, **`streamlit_app.py`**, **`README.md`** and **`tests/test_anyflip_core.py`** in the root of your existing GitHub repository. (You can also upload the entire archive's contents.) Do **not** upload the original Windows `.exe` or just the ZIP.
+2. Commit to your deployment branch, typically `main`.
+3. Streamlit normally redeploys automatically; if needed, reboot/redeploy the app in Streamlit Community Cloud.
+4. Test a small public book that you have permission to save before trying a large book.
+
+## Deploy new
+
+1. Create a GitHub repository and upload the **contents** of this archive into its root.
+2. Go to https://share.streamlit.io/ and connect your GitHub account.
+3. Choose your repo and branch, set main file to `streamlit_app.py`, and select a supported Python version (3.12 is suitable).
+4. Deploy and share your `*.streamlit.app` URL.
+
+GitHub Pages alone cannot run this Python backend; the code lives on GitHub and executes on Streamlit.
+
+## Local testing
 
 ```bash
-python -m venv .venv
-# Windows: .venv\Scripts\activate
-# Linux/macOS: source .venv/bin/activate
-python -m pip install -r requirements.txt
+python -m pip install -r requirements.txt pytest
+python -m pytest -q
 streamlit run streamlit_app.py
 ```
 
-Open `http://localhost:8501`. To run tests: `python -m pip install pytest && python -m pytest -q`.
+## Security and availability
 
-## Why not GitHub Pages?
-
-GitHub Pages hosts static files only and **cannot run Python**. The GitHub repository holds your code; **Streamlit Community Cloud runs your Python app** and supplies the public website.
-
-## Safety, limits and caveats
-
-- Outgoing requests are pinned to `https://online.anyflip.com`. The input URL accepts only AnyFlip user/book paths; redirects, arbitrary hosts and suspicious page filenames are rejected.
-- Supports public compatible `mobile/javascript/config.js` books and public page images. Does **not** bypass passwords, sign-in restrictions, copy protection or DRM. Only download books for which you have the rights.
-- Shared free hosting is for light use: default **120-page maximum**, **90 MB PDF maximum**, **5-minute processing timeout** and **2 concurrent downloads per Python process**. The app also has a 12-second *per-browser-session* cooldown, which is not robust abuse protection. For a popular public site add platform-level per-IP rate limiting, authentication, a proper job queue and object storage, or move to a dedicated backend.
-- Finished PDFs are held in the browser's server-side Streamlit session memory for download. Session expiry or app restart removes them. Session state and download widgets can consume RAM; avoid large traffic on a free plan.
-- Page images are re-encoded to JPEG, so generated PDFs may not retain searchable text and links.
-- Automated tests mock AnyFlip responses. **The live AnyFlip download workflow has not been verified** on a real book during creation of this project. Check a book you own after deploying.
+- Requests are pinned to `online.anyflip.com`, with no cross-host redirects and a bounded allowed page-image directory.
+- Only publicly available page images and supported public manifests are processed; authorization/DRM bypass is unsupported.
+- Resource limits prevent unbounded page sizes and response sizes. A 12-second per-session cooldown is not robust per-IP rate limiting.
+- Free shared Streamlit hosting is appropriate for low-traffic experiments. For a public site with sustained traffic, add server-side IP rate limiting, a job queue and object storage.
+- Generated documents use page images; searchable/selectable text and hyperlinks are generally not retained.
+- Tests mock network responses. Live AnyFlip download of a 999-page book and successful completion on Streamlit Community Cloud have **not** been verified.

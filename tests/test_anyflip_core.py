@@ -85,3 +85,144 @@ def test_oversized_download_rejected():
     with real_client(transport=transport) as client:
         with pytest.raises(core.DownloadError, match="size limit"):
             core.fetch_limited(client, "https://online.anyflip.com/a/b/x.webp", 1024)
+
+@pytest.mark.parametrize(('filename', 'expected'), [
+    ('abc.webp', 'files/large/abc.webp'),
+    ('files/large/abc.webp', 'files/large/abc.webp'),
+    ('../files/large/abc.webp', 'files/large/abc.webp'),
+    ('../../files/large/abc.webp', 'files/large/abc.webp'),
+    ('./files/mobile/page1.jpg', 'files/mobile/page1.jpg'),
+    ('/files/large/page-1.webp', 'files/large/page-1.webp'),
+    ('/user/book/files/large/page-1.webp', 'files/large/page-1.webp'),
+    ('https://online.anyflip.com/user/book/files/large/abc.webp', 'files/large/abc.webp'),
+    ('files/large/my%20page.webp', 'files/large/my%20page.webp'),
+    ('files/large/页一.webp', 'files/large/%E9%A1%B5%E4%B8%80.webp'),
+    ('files/large/abc.webp?v=2', 'files/large/abc.webp?v=2'),
+])
+def test_manifest_image_path_variants(filename, expected):
+    result = core.normalize_page_image_url(filename, '/user/book/')
+    assert result == f'https://online.anyflip.com/user/book/{expected}'
+
+
+@pytest.mark.parametrize('filename', [
+    '../../private.png',
+    'files/large/../../private.png',
+    'files/large/%252e%252e/private.webp',
+    'files/large/%2e%2e/private.webp',
+    'https://evil.example/a.webp',
+    '//evil.example/a.webp',
+    'http://online.anyflip.com/user/book/files/large/abc.webp',
+    'https://online.anyflip.com/other/book/files/large/abc.webp',
+    'https://online.anyflip.com/user/book/private.webp',
+    '/other/book/files/large/abc.webp',
+    'file:///etc/passwd',
+    'files/large/a.webp\r\nInjected: header',
+])
+def test_rejects_off_book_or_unsafe_images(filename):
+    with pytest.raises(core.DownloadError):
+        core.normalize_page_image_url(filename, '/user/book/')
+
+
+def test_actual_relative_manifest_produces_pdf(monkeypatch):
+    image = Image.new('RGB', (140, 180), 'white')
+    buf = io.BytesIO()
+    image.save(buf, format='WEBP')
+    expected_urls = [
+        '/user/book/files/large/first.webp',
+        '/user/book/files/mobile/second.webp',
+    ]
+    requested = []
+
+    def handler(request):
+        if request.url.path.endswith('/mobile/javascript/config.js'):
+            return httpx.Response(200, text='var config = {"title":"Relative Paths",'
+                                  '"pageCount":2,"fliphtml5_pages":['
+                                  '{"n":["../files/large/first.webp"]},'
+                                  '{"n":["./files/mobile/second.webp"]}]};')
+        requested.append(request.url.path)
+        if request.url.path in expected_urls:
+            return httpx.Response(200, content=buf.getvalue())
+        return httpx.Response(404)
+
+    real_client = httpx.Client
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(core.httpx, 'Client', lambda **kwargs: real_client(transport=transport, **kwargs))
+    result = core.create_pdf('https://online.anyflip.com/user/book/mobile/index.html')
+    assert result.pages == 2
+    assert requested == expected_urls
+    with fitz.open(stream=result.content, filetype='pdf') as pdf:
+        assert pdf.page_count == 2
+
+
+def test_999_page_book_auto_splits_into_ten_pdfs(monkeypatch):
+    """Verifies the page limit is functional, not only a label in the UI."""
+    import zipfile
+
+    assert core.MAX_PAGES == 999
+    image = Image.new('RGB', (100, 140), 'white')
+    buf = io.BytesIO()
+    image.save(buf, format='WEBP')
+    progress = []
+
+    def handler(request):
+        assert request.url.host == 'online.anyflip.com'
+        if request.url.path.endswith('/mobile/javascript/config.js'):
+            return httpx.Response(200, text='var config = {"title":"Big book","pageCount":999};')
+        if request.url.path.startswith('/user/book/files/large/'):
+            return httpx.Response(200, content=buf.getvalue())
+        return httpx.Response(404)
+
+    real_client = httpx.Client
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(core.httpx, 'Client', lambda **kwargs: real_client(transport=transport, **kwargs))
+    result = core.create_pdf('https://online.anyflip.com/user/book/',
+                             progress=lambda done, total: progress.append((done, total)))
+    assert result.pages == 999
+    assert result.parts == 10
+    assert result.mime == 'application/zip'
+    assert result.filename == 'Big book.zip'
+    assert progress[-1] == (999, 999)
+    assert len(progress) == 999
+    with zipfile.ZipFile(io.BytesIO(result.content)) as archive:
+        names = archive.namelist()
+        assert len(names) == 10
+        assert names[0].endswith('p1-100.pdf')
+        assert names[-1].endswith('p901-999.pdf')
+        assert sum(fitz.open(stream=archive.read(name), filetype='pdf').page_count for name in names) == 999
+
+
+def test_page_range_from_999_page_book(monkeypatch):
+    image = Image.new('RGB', (60, 90), 'white')
+    buf = io.BytesIO()
+    image.save(buf, format='WEBP')
+    calls = []
+
+    def handler(request):
+        if request.url.path.endswith('/mobile/javascript/config.js'):
+            return httpx.Response(200, text='var config = {"pageCount":999};')
+        calls.append(request.url.path)
+        return httpx.Response(200, content=buf.getvalue())
+
+    real_client = httpx.Client
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(core.httpx, 'Client', lambda **kwargs: real_client(transport=transport, **kwargs))
+    result = core.create_pdf('https://anyflip.com/user/book/', page_start=801, page_end=999)
+    assert result.pages == 199
+    assert result.parts == 1
+    assert result.mime == 'application/pdf'
+    assert 'pages 801-999' in result.filename
+    assert calls[0].endswith('/801.webp')
+    assert calls[-1].endswith('/999.webp')
+    with fitz.open(stream=result.content, filetype='pdf') as pdf:
+        assert pdf.page_count == 199
+
+
+def test_rejects_manifest_with_more_than_999_pages_and_invalid_range():
+    with pytest.raises(core.DownloadError, match='999'):
+        core.get_page_urls({'pageCount': 1000}, '/user/book/')
+    with pytest.raises(core.DownloadError):
+        core.create_pdf('https://anyflip.com/user/book/', page_start=0)
+    with pytest.raises(core.DownloadError):
+        core.create_pdf('https://anyflip.com/user/book/', page_start=900, page_end=899)
+    with pytest.raises(core.DownloadError):
+        core.create_pdf('https://anyflip.com/user/book/', output_mode='magic')
