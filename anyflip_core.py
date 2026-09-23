@@ -16,7 +16,7 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import fitz
 import httpx
@@ -24,7 +24,6 @@ from PIL import Image, UnidentifiedImageError
 
 ASSET_HOST = "https://online.anyflip.com"
 BOOK_PART = re.compile(r"[a-zA-Z0-9_-]{1,80}\Z")
-SAFE_IMAGE_PATH = re.compile(r"[a-zA-Z0-9_./-]{1,250}\Z")
 MAX_PAGES = max(1, min(300, int(os.getenv("ANYFLIP_MAX_PAGES", "120"))))
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_CONFIG_BYTES = 2 * 1024 * 1024
@@ -77,6 +76,66 @@ def extract_config(script: str) -> dict:
     return config
 
 
+def normalize_page_image_url(raw_name: str, book_path: str) -> str:
+    """Handle normal AnyFlip image filenames and same-book relative paths.
+
+    Some public manifests prefix filenames with ``../files/large/`` or use
+    absolute same-book URLs. Anchor *every* result to this book's ``/files/``
+    directory and to online.anyflip.com; never follow arbitrary URLs.
+    """
+    if not isinstance(raw_name, str) or not 0 < len(raw_name) <= 600:
+        raise DownloadError("The book contains an invalid page-image path.")
+    raw_name = raw_name.strip().replace("\\", "/")
+    if any(ord(char) < 32 or ord(char) == 127 for char in raw_name):
+        raise DownloadError("The book contains an invalid page-image path.")
+    parsed = urlsplit(raw_name)
+    if parsed.scheme or parsed.netloc:
+        if (parsed.scheme.lower() != "https" or parsed.hostname != "online.anyflip.com"
+                or parsed.username or parsed.password or parsed.port is not None):
+            raise DownloadError("The book references an unsupported external image URL.")
+        # Absolute URLs must already belong to the exact supplied book.
+        if not parsed.path.startswith(book_path + "files/"):
+            raise DownloadError("The book contains an image URL outside its book directory.")
+        image_path = parsed.path[len(book_path):]
+    else:
+        image_path = parsed.path
+        if image_path.startswith(book_path + "files/"):
+            image_path = image_path[len(book_path):]
+        elif image_path.startswith("/files/"):
+            image_path = image_path[1:]
+        elif image_path.startswith("/"):
+            raise DownloadError("The book contains an image URL outside its book directory.")
+        # A common public manifest format uses ../files/large/page.webp.
+        # Only allow parent prefixes when followed by the book's files folder.
+        if image_path.startswith("../"):
+            trimmed = image_path
+            while trimmed.startswith("../"):
+                trimmed = trimmed[3:]
+            if not trimmed.startswith("files/"):
+                raise DownloadError("The book contains an invalid page-image path.")
+            image_path = trimmed
+        while image_path.startswith("./"):
+            image_path = image_path[2:]
+        if not image_path.startswith("files/"):
+            image_path = f"files/large/{image_path}"
+
+    # Decode once to support URL-encoded Unicode/spaces, then quote once.
+    # Reject any remaining percent sign to avoid double-encoding ambiguity.
+    image_path = unquote(image_path)
+    parts = image_path.split("/")
+    if (len(image_path) > 350 or len(parts) < 3 or parts[0] != "files"
+            or parts[1] not in {"large", "mobile", "small"}
+            or any(not part or part in {".", ".."} for part in parts)
+            or any(any(ord(c) < 32 or ord(c) == 127 for c in part) for part in parts)
+            or any(c in image_path for c in "\\?#%:")):
+        raise DownloadError("The book contains an invalid page-image path.")
+    query = parsed.query
+    if len(query) > 256 or not re.fullmatch(r"[A-Za-z0-9_~.=&%+-]*", query):
+        raise DownloadError("The book contains an invalid image query string.")
+    encoded_path = quote(image_path, safe="/-._~")
+    return f"{ASSET_HOST}{book_path}{encoded_path}" + (f"?{query}" if query else "")
+
+
 def get_page_urls(config: dict, path: str) -> tuple[str, list[str]]:
     metadata = config.get("meta") if isinstance(config.get("meta"), dict) else {}
     book_config = config.get("bookConfig") if isinstance(config.get("bookConfig"), dict) else {}
@@ -100,14 +159,15 @@ def get_page_urls(config: dict, path: str) -> tuple[str, list[str]]:
         if index < len(pages) and isinstance(pages[index], dict):
             names = pages[index].get("n") or []
             if isinstance(names, list) and names and isinstance(names[0], str):
-                filename = names[0].lstrip("/")
+                filename = names[0]
+            elif isinstance(names, str):
+                filename = names
         if not filename:
             filename = f"files/large/{index + 1}.webp"
-        elif not filename.startswith("files/"):
-            filename = f"files/large/{filename}"
-        if ".." in filename or not SAFE_IMAGE_PATH.fullmatch(filename):
-            raise DownloadError("The book contains an invalid page-image path.")
-        urls.append(f"{ASSET_HOST}{path}{filename}")
+        try:
+            urls.append(normalize_page_image_url(filename, path))
+        except DownloadError as exc:
+            raise DownloadError(f"Page {index + 1}: {exc}") from exc
     return title, urls
 
 
